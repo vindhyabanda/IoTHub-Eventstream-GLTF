@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Ultra-minimal Azure Event Hub consumer for maximum compatibility
+Azure Event Hub Consumer
 Uses the absolute bare minimum configuration
 """
 
@@ -46,16 +46,74 @@ message_queue = queue.Queue()
 logging.basicConfig(level=logging.WARNING)  # Reduce log noise
 
 def process_message(message):
-    """Process message and broadcast formatted rack updates to WebSocket"""
+    """Process OTEL message and broadcast formatted rack updates to WebSocket"""
     try:
-        raw_data = message.value
-        print(f"📩 Got message: {raw_data}")
+        # Show complete Kafka message structure
+        print(f"📩 === FULL KAFKA MESSAGE ===")
+        print(f"📍 Topic: {message.topic}")
+        print(f"📍 Partition: {message.partition}")
+        print(f"📍 Offset: {message.offset}")
+        print(f"📍 Timestamp: {message.timestamp}")
+        print(f"📍 Headers: {message.headers}")
+        print(f"📍 Key: {message.key}")
         
-        # Handle array-wrapped messages
-        if isinstance(raw_data, list):
-            data_list = raw_data
+        # The value is already parsed as JSON by the deserializer
+        parsed_data = message.value
+        print(f"📩 Parsed Value: {json.dumps(parsed_data, indent=2)}")
+        
+        # Check if this is OTEL format
+        if isinstance(parsed_data, dict):
+            if 'resourceLogs' in parsed_data:
+                print(f"🔍 OTEL Format Detected - Resource Logs")
+                otel_data = parsed_data
+            elif 'resourceSpans' in parsed_data:
+                print(f"🔍 OTEL Format Detected - Resource Spans")
+                otel_data = parsed_data
+            elif 'resourceMetrics' in parsed_data:
+                print(f"🔍 OTEL Format Detected - Resource Metrics")
+                otel_data = parsed_data
+            else:
+                print(f"🔍 Custom Format - Using direct data")
+                otel_data = parsed_data
         else:
-            data_list = [raw_data]
+            print(f"🔍 Data Format: {type(parsed_data)}")
+            otel_data = parsed_data
+        
+        # Extract data for processing (handle both OTEL and custom formats)
+        data_list = []
+        
+        # Handle OTEL Resource Logs format
+        if 'resourceLogs' in otel_data:
+            for resource_log in otel_data.get('resourceLogs', []):
+                for scope_log in resource_log.get('scopeLogs', []):
+                    for log_record in scope_log.get('logRecords', []):
+                        # Extract attributes from OTEL log record
+                        attributes = {}
+                        for attr in log_record.get('attributes', []):
+                            key = attr.get('key', '')
+                            value = attr.get('value', {})
+                            if 'stringValue' in value:
+                                attributes[key] = value['stringValue']
+                            elif 'doubleValue' in value:
+                                attributes[key] = value['doubleValue']
+                            elif 'intValue' in value:
+                                attributes[key] = value['intValue']
+                        
+                        # Try to extract temperature and path from OTEL attributes or body
+                        data_item = {
+                            'path': attributes.get('path', '/World/Rack1/'),
+                            'temperature': float(attributes.get('temperature', 20.0)),
+                            'status': attributes.get('status', 'OK'),
+                            'otel_timestamp': log_record.get('timeUnixNano'),
+                            'otel_body': log_record.get('body', {})
+                        }
+                        data_list.append(data_item)
+        
+        # Handle direct data format (your current messages)
+        elif isinstance(otel_data, list):
+            data_list = otel_data
+        else:
+            data_list = [otel_data]
         
         # Process each data item
         for data in data_list:
@@ -144,12 +202,13 @@ async def websocket_handler(websocket):
         connected_clients.discard(websocket)
         print(f"👋 WebSocket disconnected. Active: {len(connected_clients)}")
 
-def ultra_minimal_consumer():
-    """Ultra-minimal consumer using simplest approach"""
-    print("🚀 Starting ultra-minimal Azure Event Hub consumer...")
+def minimal_consumer():
+    print("🚀 Starting Azure Event Hub consumer...")
     print(f"📡 Server: {bootstrap_server}")
     print(f"📋 Topic: {TOPIC_NAME}")
     print(f"👥 Group: {CONSUMER_GROUP}")
+    print(f"🔑 Connection String Length: {len(EVENT_HUB_CONNECTION_STRING)} chars")
+    print(f"🔑 Connection String Preview: {EVENT_HUB_CONNECTION_STRING[:50]}...")
     
     while True:
         try:
@@ -168,8 +227,9 @@ def ultra_minimal_consumer():
             message_count = 0
             for message in consumer:
                 message_count += 1
-                print(f"📩 Message {message_count}")
+                print(f"\n📩 === Processing Message {message_count} ===")
                 process_message(message)
+                print(f"📩 === End Message {message_count} ===\n")
                 
         except Exception as e:
             print(f"❌ Consumer error: {e}")
@@ -183,10 +243,10 @@ def ultra_minimal_consumer():
 
 async def main():
     """Main function"""
-    print("🚀 Ultra-minimal Kafka to WebSocket bridge")
+    print("🚀 Kafka to WebSocket bridge")
     
     # Start consumer thread
-    kafka_thread = threading.Thread(target=ultra_minimal_consumer, daemon=True)
+    kafka_thread = threading.Thread(target=minimal_consumer, daemon=True)
     kafka_thread.start()
     
     # Start WebSocket server

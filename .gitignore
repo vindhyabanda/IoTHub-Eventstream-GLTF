@@ -5,6 +5,9 @@ ENV/
 env.bak/
 venv.bak/
 
+# Sensitive Information
+nvidia_bms_data.csv
+
 # Python
 __pycache__/
 *.py[cod]
