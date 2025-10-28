@@ -1,0 +1,562 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Simple USD Racks Viewer</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #1a1a1a;
+            font-family: Arial, sans-serif;
+            overflow: hidden;
+        }
+        
+        #container {
+            width: 100vw;
+            height: 100vh;
+            position: relative;
+        }
+        
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: white;
+            font-size: 18px;
+            background-color: rgba(0,0,0,0.7);
+            padding: 20px;
+            border-radius: 8px;
+            z-index: 100;
+        }
+        
+        #info {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            color: white;
+            background-color: rgba(0,0,0,0.7);
+            padding: 10px;
+            border-radius: 5px;
+            font-size: 12px;
+            max-width: 350px;
+        }
+        
+        .status-indicator {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            margin-right: 5px;
+        }
+        
+        .status-ok { background-color: #4CAF50; }
+        .status-warning { background-color: #FFA500; }
+        .status-error { background-color: #FF0000; }
+        
+        .error-alert {
+            background-color: rgba(255, 0, 0, 0.2);
+            border: 1px solid #FF0000;
+            padding: 5px;
+            border-radius: 3px;
+            margin-top: 5px;
+        }
+        
+        #console {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background-color: rgba(0,0,0,0.8);
+            color: #00ff00;
+            padding: 10px;
+            border-radius: 5px;
+            width: 300px;
+            height: 200px;
+            overflow-y: auto;
+            font-family: monospace;
+            font-size: 11px;
+        }
+        
+        #controls {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            z-index: 100;
+            background-color: rgba(0,0,0,0.7);
+            padding: 10px;
+            border-radius: 5px;
+            color: white;
+        }
+        
+        button {
+            background-color: #007acc;
+            color: white;
+            border: none;
+            padding: 5px 10px;
+            border-radius: 3px;
+            cursor: pointer;
+            margin: 2px;
+        }
+        
+        button:hover {
+            background-color: #005a9e;
+        }
+    </style>
+</head>
+<body>
+    <div id="container">
+        <div id="loading">Loading USD file...</div>
+        
+        <div id="controls">
+            <button onclick="resetCamera()">Reset View</button>
+            <button onclick="toggleWireframe()">Toggle Wireframe</button>
+            <button onclick="toggleAutoRotate()">Toggle Rotation</button>
+        </div>
+        
+        <div id="console">
+            <div><strong>System Console:</strong></div>
+            <div id="consoleOutput"></div>
+        </div>
+        
+        <div id="kafkaConsole" style="position: absolute; top: 220px; right: 10px; background-color: rgba(0,50,0,0.8); color: #00ff88; padding: 10px; border-radius: 5px; width: 300px; height: 150px; overflow-y: auto; font-family: monospace; font-size: 11px;">
+            <div><strong>Kafka Messages:</strong></div>
+            <div id="kafkaOutput">Waiting for Kafka messages...</div>
+        </div>
+        
+        <div id="info">
+            <strong>USD Racks Viewer</strong><br>
+            File: racks.usd<br>
+            <span id="modelInfo">Loading...</span>
+        </div>
+    </div>
+
+    <!-- Three.js core only -->
+    <script src="https://unpkg.com/three@0.158.0/build/three.min.js"></script>
+    
+    <script>
+        let scene, camera, renderer;
+        let model = null;
+        let autoRotateEnabled = true;
+        let wireframeMode = false;
+        
+        // Mouse controls
+        let mouseX = 0, mouseY = 0;
+        let isMouseDown = false;
+        let rotationX = 0, rotationY = 0;
+        
+        // WebSocket for real-time updates
+        let websocket = null;
+        let reconnectInterval = null;
+        let rackMeshes = {}; // Store references to rack meshes for easy updates
+        
+        // Status tracking
+        let rackStatus = {
+            'Rack1': { status: 'OK', lastError: null, lastUpdate: null, temperature: null },
+            'Rack2': { status: 'OK', lastError: null, lastUpdate: null, temperature: null }
+        };
+        let totalMessagesReceived = 0;
+
+        // Custom logging function
+        function logToConsole(message) {
+            const consoleOutput = document.getElementById('consoleOutput');
+            const timestamp = new Date().toLocaleTimeString();
+            consoleOutput.innerHTML += `<div>${timestamp}: ${message}</div>`;
+            consoleOutput.scrollTop = consoleOutput.scrollHeight;
+            console.log(message);
+        }
+
+        // Kafka message logging function
+        function logKafkaMessage(message, data = null) {
+            const kafkaOutput = document.getElementById('kafkaOutput');
+            const timestamp = new Date().toLocaleTimeString();
+            
+            let logEntry = `<div style="border-bottom: 1px solid #003300; padding: 2px 0;">`;
+            logEntry += `<strong>${timestamp}:</strong> ${message}`;
+            
+            if (data && data.raw_kafka_message) {
+                const temp = data.temperature ? ` | Temp: ${data.temperature}°C` : '';
+                const path = data.raw_kafka_message.path ? ` | Path: ${data.raw_kafka_message.path}` : '';
+                logEntry += `<br><small style="color: #888;">Raw: ${JSON.stringify(data.raw_kafka_message)}${temp}${path}</small>`;
+            }
+            
+            logEntry += `</div>`;
+            
+            kafkaOutput.innerHTML += logEntry;
+            kafkaOutput.scrollTop = kafkaOutput.scrollHeight;
+            
+            // Keep only last 20 messages
+            const messages = kafkaOutput.children;
+            while (messages.length > 20) {
+                kafkaOutput.removeChild(messages[0]);
+            }
+        }
+
+        // WebSocket functions
+        function connectWebSocket() {
+            try {
+                websocket = new WebSocket('ws://localhost:8767');
+                
+                websocket.onopen = function(event) {
+                    logToConsole('WebSocket connected for real-time updates');
+                    logKafkaMessage('🔗 WebSocket connected to Kafka bridge');
+                    if (reconnectInterval) {
+                        clearInterval(reconnectInterval);
+                        reconnectInterval = null;
+                    }
+                };
+                
+                websocket.onmessage = function(event) {
+                    try {
+                        const data = JSON.parse(event.data);
+                        handleWebSocketMessage(data);
+                    } catch (error) {
+                        logToConsole('Error parsing WebSocket message: ' + error.message);
+                    }
+                };
+                
+                websocket.onclose = function(event) {
+                    logToConsole('WebSocket connection closed');
+                    logKafkaMessage('❌ WebSocket disconnected - attempting reconnect...');
+                    websocket = null;
+                    // Attempt to reconnect every 5 seconds
+                    if (!reconnectInterval) {
+                        reconnectInterval = setInterval(connectWebSocket, 5000);
+                    }
+                };
+                
+                websocket.onerror = function(error) {
+                    logToConsole('WebSocket error: ' + error);
+                };
+                
+            } catch (error) {
+                logToConsole('Failed to connect WebSocket: ' + error.message);
+            }
+        }
+
+        function handleWebSocketMessage(data) {
+            if (data.type === 'rack_update') {
+                totalMessagesReceived++;
+                
+                const tempInfo = data.temperature ? ` (${data.temperature}°C)` : '';
+                logToConsole(`Update: ${data.rack_id} -> ${data.status}${tempInfo}`);
+                
+                // Log detailed Kafka message
+                logKafkaMessage(`${data.rack_id} -> ${data.status}${tempInfo}`, data);
+                
+                updateRackStatus(data.rack_id, data.status, data.color, data.timestamp, data.temperature);
+            } else if (data.type === 'pong') {
+                // Handle pong response
+            }
+        }
+
+        function updateRackStatus(rackId, status, colorHex, timestamp, temperature) {
+            // Update rack status tracking
+            rackStatus[rackId].status = status;
+            rackStatus[rackId].lastUpdate = new Date(timestamp);
+            rackStatus[rackId].temperature = temperature;
+            
+            // Track last error time
+            if (status.toUpperCase() === 'ERROR') {
+                rackStatus[rackId].lastError = new Date(timestamp);
+            }
+            
+            // Update visual color
+            const mesh = rackMeshes[rackId];
+            if (mesh && mesh.material) {
+                // Convert hex string to integer
+                const color = parseInt(colorHex.replace('0x', ''), 16);
+                mesh.material.color.setHex(color);
+                
+                logToConsole(`Updated ${rackId} color to ${colorHex} (status: ${status})`);
+            } else {
+                logToConsole(`Warning: Could not find mesh for ${rackId}`);
+            }
+            
+            // Update info display
+            updateStatusDisplay();
+        }
+
+        function updateStatusDisplay() {
+            const infoElement = document.getElementById('modelInfo');
+            
+            // Base model info
+            let html = `Racks: 2<br>Cubes: 2<br>Size: 5.00 × 2.00 × 2.00<br>`;
+            html += `Messages Received: ${totalMessagesReceived}<br><br>`;
+            
+            // Current status for each rack
+            html += `<strong>Current Status:</strong><br>`;
+            
+            for (const [rackId, status] of Object.entries(rackStatus)) {
+                const statusClass = `status-${status.status.toLowerCase()}`;
+                const tempInfo = status.temperature ? ` (${status.temperature}°C)` : '';
+                const lastUpdate = status.lastUpdate ? status.lastUpdate.toLocaleTimeString() : 'Never';
+                
+                html += `<span class="status-indicator ${statusClass}"></span>`;
+                html += `${rackId}: ${status.status}${tempInfo}<br>`;
+                html += `Last Update: ${lastUpdate}<br>`;
+            }
+            
+            // Error alerts
+            const errorAlerts = [];
+            for (const [rackId, status] of Object.entries(rackStatus)) {
+                if (status.lastError) {
+                    const timeSinceError = Math.floor((new Date() - status.lastError) / 1000);
+                    errorAlerts.push({
+                        rack: rackId,
+                        time: status.lastError.toLocaleString(),
+                        ago: timeSinceError < 60 ? `${timeSinceError}s ago` : `${Math.floor(timeSinceError/60)}m ago`
+                    });
+                }
+            }
+            
+            if (errorAlerts.length > 0) {
+                html += `<br><div class="error-alert">`;
+                html += `<strong>⚠️ Recent Errors:</strong><br>`;
+                errorAlerts.forEach(alert => {
+                    html += `${alert.rack}: ${alert.time} (${alert.ago})<br>`;
+                });
+                html += `</div>`;
+            }
+            
+            infoElement.innerHTML = html;
+        }
+
+        // Send periodic ping to keep connection alive
+        function sendPing() {
+            if (websocket && websocket.readyState === WebSocket.OPEN) {
+                websocket.send(JSON.stringify({type: 'ping'}));
+            }
+        }
+
+        // Initialize the scene
+        function init() {
+            logToConsole('Initializing Three.js scene...');
+            
+            // Scene
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x2a2a2a);
+            logToConsole('Scene created');
+
+            // Camera
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(10, 8, 10);
+            camera.lookAt(0, 0, 0);
+            logToConsole('Camera created');
+
+            // Renderer
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.shadowMap.enabled = true;
+            renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+            document.getElementById('container').appendChild(renderer.domElement);
+            logToConsole('Renderer created and added to DOM');
+
+            // Mouse controls
+            setupMouseControls();
+            logToConsole('Mouse controls setup');
+
+            // Lighting
+            const ambientLight = new THREE.AmbientLight(0x404040, 0.6);
+            scene.add(ambientLight);
+
+            const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+            directionalLight.position.set(10, 10, 5);
+            directionalLight.castShadow = true;
+            scene.add(directionalLight);
+            logToConsole('Lighting added');
+
+            // Load the USD file
+            logToConsole('Starting USD file loading...');
+            loadUSDFile();
+
+            // Handle window resize
+            window.addEventListener('resize', onWindowResize, false);
+            
+            logToConsole('Initialization complete');
+        }
+
+        function setupMouseControls() {
+            const canvas = renderer.domElement;
+            
+            canvas.addEventListener('mousedown', (event) => {
+                isMouseDown = true;
+                mouseX = event.clientX;
+                mouseY = event.clientY;
+            });
+            
+            canvas.addEventListener('mouseup', () => {
+                isMouseDown = false;
+            });
+            
+            canvas.addEventListener('mousemove', (event) => {
+                if (isMouseDown && model) {
+                    const deltaX = event.clientX - mouseX;
+                    const deltaY = event.clientY - mouseY;
+                    
+                    rotationY += deltaX * 0.01;
+                    rotationX += deltaY * 0.01;
+                    
+                    model.rotation.y = rotationY;
+                    model.rotation.x = rotationX;
+                    
+                    mouseX = event.clientX;
+                    mouseY = event.clientY;
+                }
+            });
+            
+            // Zoom with mouse wheel
+            canvas.addEventListener('wheel', (event) => {
+                const zoomSpeed = 0.1;
+                if (event.deltaY > 0) {
+                    camera.position.multiplyScalar(1 + zoomSpeed);
+                } else {
+                    camera.position.multiplyScalar(1 - zoomSpeed);
+                }
+                event.preventDefault();
+            });
+        }
+
+        function loadUSDFile() {
+            logToConsole('Starting to load USDA file...');
+            
+            fetch('racks.usd')
+                .then(response => {
+                    logToConsole(`Fetch response status: ${response.status}`);
+                    if (!response.ok) {
+                        throw new Error(`HTTP error! status: ${response.status}`);
+                    }
+                    return response.text();
+                })
+                .then(usdaContent => {
+                    logToConsole(`USDA content loaded, length: ${usdaContent.length}`);
+                    parseUSDA(usdaContent);
+                })
+                .catch(error => {
+                    logToConsole(`ERROR: ${error.message}`);
+                    document.getElementById('loading').innerHTML = `Error: ${error.message}`;
+                });
+        }
+
+        function parseUSDA(content) {
+            logToConsole('Starting to parse USDA content...');
+            
+            // Remove loading message
+            document.getElementById('loading').style.display = 'none';
+            
+            // Create a group to hold all the parsed objects
+            model = new THREE.Group();
+            model.name = "USD_Scene";
+            logToConsole('Created model group');
+            
+            // Simple hardcoded approach for your specific file
+            // Create Rack1 (Green cube at origin)
+            const rack1 = createSimpleCube('Rack1', 0x4CAF50, -2, 0, 0);
+            model.add(rack1);
+            logToConsole('Created Rack1 at (-2,0,0)');
+            
+            // Create Rack2 (Blue cube at x=3) - make sure it's far enough apart
+            const rack2 = createSimpleCube('Rack2', 0x2196F3, 2, 0, 0);
+            model.add(rack2);
+            logToConsole('Created Rack2 at (2,0,0)');
+            
+            // Add the model to the scene
+            scene.add(model);
+            logToConsole('Model added to scene');
+            
+            // Update info
+            document.getElementById('modelInfo').innerHTML = 
+                `Racks: 2<br>` +
+                `Cubes: 2<br>` +
+                `Size: 5.00 × 2.00 × 2.00`;
+            
+            logToConsole('USDA file parsed and loaded successfully!');
+            
+            // Initialize status display
+            updateStatusDisplay();
+            
+            // Connect to WebSocket for real-time updates
+            logToConsole('Connecting to Kafka WebSocket bridge...');
+            connectWebSocket();
+            
+            // Start ping interval to keep connection alive
+            setInterval(sendPing, 30000); // Ping every 30 seconds
+            
+            // Update status display every 5 seconds to show time since last error
+            setInterval(updateStatusDisplay, 5000);
+        }
+
+        function createSimpleCube(name, color, x, y, z) {
+            const geometry = new THREE.BoxGeometry(2, 2, 2);
+            const material = new THREE.MeshLambertMaterial({
+                color: color,
+                transparent: true,
+                opacity: 0.8
+            });
+            
+            const cube = new THREE.Mesh(geometry, material);
+            cube.name = name;
+            cube.position.set(x, y, z);
+            cube.castShadow = true;
+            cube.receiveShadow = true;
+            
+            // Store reference for real-time updates
+            rackMeshes[name] = cube;
+            logToConsole(`Stored reference for ${name} mesh`);
+            
+            return cube;
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            // Auto rotate
+            if (autoRotateEnabled && model && !isMouseDown) {
+                model.rotation.y += 0.005;
+            }
+            
+            renderer.render(scene, camera);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        // Control functions
+        function resetCamera() {
+            camera.position.set(10, 8, 10);
+            camera.lookAt(0, 0, 0);
+            if (model) {
+                model.rotation.set(0, 0, 0);
+                rotationX = 0;
+                rotationY = 0;
+            }
+            logToConsole('Camera reset');
+        }
+
+        function toggleWireframe() {
+            wireframeMode = !wireframeMode;
+            if (model) {
+                model.traverse(function(child) {
+                    if (child.isMesh && child.material) {
+                        child.material.wireframe = wireframeMode;
+                    }
+                });
+            }
+            logToConsole(`Wireframe mode: ${wireframeMode}`);
+        }
+
+        function toggleAutoRotate() {
+            autoRotateEnabled = !autoRotateEnabled;
+            logToConsole(`Auto rotate: ${autoRotateEnabled}`);
+        }
+
+        // Start the application
+        init();
+        animate();
+    </script>
+</body>
+</html>

@@ -1,0 +1,4 @@
+azure-iot-device
+pandas
+kafka-python
+websockets==2.12.0
