@@ -1,7 +1,7 @@
 # Configuration template file
 # Copy this to config.py and fill in your actual credentials
 
-# Azure IoT Hub Configuration
+# Azure IoT Hub Configuration (Use device connecting string)
 IOT_HUB_CONNECTION_STRING = "HostName=YOUR_IOT_HUB.azure-devices.net;DeviceId=YOUR_DEVICE_ID;SharedAccessKey=YOUR_SHARED_ACCESS_KEY"
 
 # Azure Event Hub (Kafka) Configuration
